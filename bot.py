@@ -46,23 +46,7 @@ db.commit()
 
 
 # =========================================================
-# BOT
-# =========================================================
-
-intents = discord.Intents.default()
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
-
-# user_id -> last dispenser use
-cooldowns = {}
-
-
-# =========================================================
-# DATABASE HELPERS
+# HELPERS
 # =========================================================
 
 def get_links():
@@ -98,7 +82,7 @@ def get_settings(guild_id):
     return (0, 0, "dm")
 
 
-def is_admin(interaction: discord.Interaction):
+def is_admin(interaction):
     return (
         interaction.guild is not None
         and interaction.user.guild_permissions.administrator
@@ -129,6 +113,35 @@ def format_uptime(seconds):
 
 
 # =========================================================
+# BOT
+# =========================================================
+
+intents = discord.Intents.default()
+
+
+class AvLinkBot(commands.Bot):
+
+    async def setup_hook(self):
+        self.add_view(DispenserPanel())
+
+        try:
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} slash commands.")
+        except Exception as error:
+            print(f"Command sync error: {error}")
+
+
+bot = AvLinkBot(
+    command_prefix="!",
+    intents=intents
+)
+
+
+# user_id -> last successful dispenser use
+cooldowns = {}
+
+
+# =========================================================
 # READY
 # =========================================================
 
@@ -136,15 +149,9 @@ def format_uptime(seconds):
 async def on_ready():
     print(f"AvLink is online as {bot.user}")
 
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands.")
-    except Exception as error:
-        print(f"Command sync error: {error}")
-
 
 # =========================================================
-# PERSISTENT VIEWS
+# DISPENSER PANEL
 # =========================================================
 
 class DispenserPanel(discord.ui.View):
@@ -172,10 +179,6 @@ class DispenserPanel(discord.ui.View):
             )
             return
 
-        # -----------------------------------------
-        # COOLDOWN
-        # -----------------------------------------
-
         if interaction.guild:
             cooldown, remove_after_use, default_delivery = get_settings(
                 interaction.guild.id
@@ -190,7 +193,7 @@ class DispenserPanel(discord.ui.View):
         if cooldown > 0:
             last_use = cooldowns.get(interaction.user.id)
 
-            if last_use:
+            if last_use is not None:
                 remaining = cooldown - (now - last_use)
 
                 if remaining > 0:
@@ -200,20 +203,13 @@ class DispenserPanel(discord.ui.View):
                     )
                     return
 
-        # -----------------------------------------
-        # CHOOSE DELIVERY METHOD
-        # -----------------------------------------
-
-        view = DeliveryView(
-            links=links,
-            default_delivery=default_delivery,
-            remove_after_use=bool(remove_after_use),
-            cooldown=cooldown
-        )
-
         await interaction.response.send_message(
             "Choose how you want to receive your link.",
-            view=view,
+            view=DeliveryView(
+                links,
+                default_delivery,
+                bool(remove_after_use)
+            ),
             ephemeral=True
         )
 
@@ -228,28 +224,24 @@ class DeliverySelect(discord.ui.Select):
         self,
         links,
         default_delivery,
-        remove_after_use,
-        cooldown
+        remove_after_use
     ):
 
         self.links = links
         self.remove_after_use = remove_after_use
-        self.cooldown = cooldown
-
-        default_index = 0 if default_delivery == "dm" else 1
 
         options = [
             discord.SelectOption(
                 label="dm",
                 description="send the link to your direct messages",
                 value="dm",
-                default=default_index == 0
+                default=default_delivery == "dm"
             ),
             discord.SelectOption(
-                label="private message",
+                label="private",
                 description="show the link only to you in this channel",
                 value="private",
-                default=default_index == 1
+                default=default_delivery == "private"
             )
         ]
 
@@ -258,21 +250,25 @@ class DeliverySelect(discord.ui.Select):
             options=options
         )
 
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction):
 
         method = self.values[0]
 
-        link_id, url = random.choice(self.links)
+        # Pick a link at the moment the user confirms.
+        links = get_links()
 
-        # -----------------------------------------
-        # COOLDOWN STARTS AFTER SUCCESSFUL SELECTION
-        # -----------------------------------------
+        if not links:
+            await interaction.response.edit_message(
+                content="There are currently no links available.",
+                view=None
+            )
+            return
 
-        cooldowns[interaction.user.id] = time.monotonic()
+        link_id, url = random.choice(links)
 
-        # -----------------------------------------
-        # DM
-        # -----------------------------------------
+        # =================================================
+        # DM DELIVERY
+        # =================================================
 
         if method == "dm":
 
@@ -281,33 +277,38 @@ class DeliverySelect(discord.ui.Select):
                     f"your avlink:\n{url}"
                 )
 
-                if self.remove_after_use:
-                    db.execute(
-                        "DELETE FROM links WHERE id = ?",
-                        (link_id,)
-                    )
-                    db.commit()
-
-                await interaction.response.edit_message(
-                    content="link sent to your dms.",
-                    view=None
-                )
-
             except discord.Forbidden:
 
                 await interaction.response.edit_message(
                     content=(
-                        "i couldn't send you a dm. "
-                        "please enable direct messages from this server."
+                        "I couldn't send you a DM. "
+                        "Please enable direct messages from this server."
                     ),
                     view=None
                 )
+                return
+
+            cooldowns[interaction.user.id] = time.monotonic()
+
+            if self.remove_after_use:
+                db.execute(
+                    "DELETE FROM links WHERE id = ?",
+                    (link_id,)
+                )
+                db.commit()
+
+            await interaction.response.edit_message(
+                content="Link sent to your DMs.",
+                view=None
+            )
 
             return
 
-        # -----------------------------------------
-        # PRIVATE CHANNEL MESSAGE
-        # -----------------------------------------
+        # =================================================
+        # PRIVATE DELIVERY
+        # =================================================
+
+        cooldowns[interaction.user.id] = time.monotonic()
 
         if self.remove_after_use:
             db.execute(
@@ -317,7 +318,7 @@ class DeliverySelect(discord.ui.Select):
             db.commit()
 
         await interaction.response.edit_message(
-            content=f"your avlink:\n{url}",
+            content=f"Your avlink:\n{url}",
             view=None
         )
 
@@ -328,8 +329,7 @@ class DeliveryView(discord.ui.View):
         self,
         links,
         default_delivery,
-        remove_after_use,
-        cooldown
+        remove_after_use
     ):
 
         super().__init__(timeout=60)
@@ -338,8 +338,7 @@ class DeliveryView(discord.ui.View):
             DeliverySelect(
                 links,
                 default_delivery,
-                remove_after_use,
-                cooldown
+                remove_after_use
             )
         )
 
@@ -379,7 +378,6 @@ async def linkadd(
             "INSERT INTO links (url) VALUES (?)",
             (link,)
         )
-
         db.commit()
 
     except sqlite3.IntegrityError:
@@ -456,8 +454,7 @@ class LinkPages(discord.ui.View):
     def total_pages(self):
         return max(
             1,
-            (len(self.links) + self.per_page - 1)
-            // self.per_page
+            (len(self.links) + self.per_page - 1) // self.per_page
         )
 
     def update_buttons(self):
@@ -467,10 +464,7 @@ class LinkPages(discord.ui.View):
     def make_embed(self):
 
         start = self.page * self.per_page
-
-        current = self.links[
-            start:start + self.per_page
-        ]
+        current = self.links[start:start + self.per_page]
 
         embed = discord.Embed(
             title="avlink current links",
@@ -485,7 +479,6 @@ class LinkPages(discord.ui.View):
             current,
             start=start + 1
         ):
-
             embed.add_field(
                 name=f"{number}.",
                 value=url,
@@ -542,7 +535,7 @@ class LinkPages(discord.ui.View):
     name="currentlinks",
     description="show the current links in the dispenser"
 )
-async def currentlinks(interaction: discord.Interaction):
+async def currentlinks(interaction):
 
     links = get_links()
 
@@ -585,7 +578,7 @@ async def panel(
     embed = discord.Embed(
         title="avlink link dispenser",
         description=(
-            "select the button below to receive a random "
+            "Select the button below to receive a random "
             "available link."
         ),
         color=discord.Color.blurple()
@@ -621,22 +614,23 @@ async def panel(
 class SettingsSelect(discord.ui.Select):
 
     def __init__(self, guild_id):
+
         self.guild_id = guild_id
 
         options = [
             discord.SelectOption(
                 label="toggle remove after use",
-                description="remove a link after someone receives it",
+                description="remove a link after it is dispensed",
                 value="remove"
             ),
             discord.SelectOption(
                 label="set cooldown",
-                description="set the time users must wait between links",
+                description="set the user cooldown",
                 value="cooldown"
             ),
             discord.SelectOption(
                 label="set default delivery",
-                description="choose the default delivery method",
+                description="set the default delivery method",
                 value="delivery"
             )
         ]
@@ -646,7 +640,7 @@ class SettingsSelect(discord.ui.Select):
             options=options
         )
 
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction):
 
         if not is_admin(interaction):
             await interaction.response.send_message(
@@ -656,6 +650,10 @@ class SettingsSelect(discord.ui.Select):
             return
 
         setting = self.values[0]
+
+        # -----------------------------------------
+        # REMOVE AFTER USE
+        # -----------------------------------------
 
         if setting == "remove":
 
@@ -682,11 +680,19 @@ class SettingsSelect(discord.ui.Select):
                 ephemeral=True
             )
 
+        # -----------------------------------------
+        # COOLDOWN
+        # -----------------------------------------
+
         elif setting == "cooldown":
 
             await interaction.response.send_modal(
                 CooldownModal(self.guild_id)
             )
+
+        # -----------------------------------------
+        # DEFAULT DELIVERY
+        # -----------------------------------------
 
         elif setting == "delivery":
 
@@ -698,6 +704,7 @@ class SettingsSelect(discord.ui.Select):
 class CooldownModal(discord.ui.Modal):
 
     def __init__(self, guild_id):
+
         super().__init__(title="set cooldown")
 
         self.guild_id = guild_id
@@ -711,10 +718,7 @@ class CooldownModal(discord.ui.Modal):
 
         self.add_item(self.seconds)
 
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
+    async def on_submit(self, interaction):
 
         try:
             value = int(self.seconds.value)
@@ -723,6 +727,7 @@ class CooldownModal(discord.ui.Modal):
                 raise ValueError
 
         except ValueError:
+
             await interaction.response.send_message(
                 "enter a number between 0 and 86400.",
                 ephemeral=True
@@ -749,6 +754,7 @@ class CooldownModal(discord.ui.Modal):
 class DeliveryModal(discord.ui.Modal):
 
     def __init__(self, guild_id):
+
         super().__init__(title="set default delivery")
 
         self.guild_id = guild_id
@@ -762,14 +768,12 @@ class DeliveryModal(discord.ui.Modal):
 
         self.add_item(self.delivery)
 
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
+    async def on_submit(self, interaction):
 
         value = self.delivery.value.lower().strip()
 
         if value not in ("dm", "private"):
+
             await interaction.response.send_message(
                 "enter either dm or private.",
                 ephemeral=True
@@ -797,7 +801,7 @@ class DeliveryModal(discord.ui.Modal):
     name="settings",
     description="open the avlink settings panel"
 )
-async def settings(interaction: discord.Interaction):
+async def settings(interaction):
 
     if not is_admin(interaction):
         await interaction.response.send_message(
@@ -859,9 +863,9 @@ async def settings(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="ping",
-    description="check avlink latency, uptime, and active servers"
+    description="check bot latency, uptime, and active servers"
 )
-async def ping(interaction: discord.Interaction):
+async def ping(interaction):
 
     latency = round(bot.latency * 1000)
 
@@ -869,7 +873,7 @@ async def ping(interaction: discord.Interaction):
         time.monotonic() - START_TIME
     )
 
-    servers = len(bot.guilds)
+    server_count = len(bot.guilds)
 
     embed = discord.Embed(
         title="avlink status",
@@ -890,7 +894,7 @@ async def ping(interaction: discord.Interaction):
 
     embed.add_field(
         name="active servers",
-        value=str(servers),
+        value=str(server_count),
         inline=True
     )
 
@@ -901,12 +905,7 @@ async def ping(interaction: discord.Interaction):
 
 
 # =========================================================
-# STARTUP
+# START
 # =========================================================
-
-async def setup_hook():
-    bot.add_view(DispenserPanel())
-
-bot.setup_hook = setup_hook
 
 bot.run(TOKEN)
