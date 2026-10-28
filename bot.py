@@ -278,9 +278,10 @@ async def deliver(interaction, gid, cid, method, remove_after):
 class DeliverySelect(discord.ui.Select):
     def __init__(self, gid, cid, default, remove_after):
         self.gid, self.cid, self.remove_after = gid, cid, remove_after
-        super().__init__(placeholder="choose delivery method", options=[
-            discord.SelectOption(label="dm", description="send the link to your direct messages", value="dm", default=default == "dm"),
-            discord.SelectOption(label="private", description="show the link only to you in this channel", value="private", default=default == "private")
+        # Keep both options selectable; show the configured default in the placeholder.
+        super().__init__(placeholder=f"choose delivery method (default: {default})", options=[
+            discord.SelectOption(label="dm", description="send the link to your direct messages", value="dm"),
+            discord.SelectOption(label="private", description="show the link only to you in this channel", value="private")
         ])
 
     async def callback(self, interaction):
@@ -324,6 +325,18 @@ class CategoryView(discord.ui.View):
         self.add_item(CategorySelect(gid, default, remove_after))
 
 
+def panel_embed(gid):
+    _, _, default, _, _ = settings_for(gid)
+    e = discord.Embed(
+        title="avlink link dispenser",
+        description="select the button below, then choose a category to receive a random link.",
+        color=discord.Color.blurple(),
+    )
+    e.add_field(name="available links", value=str(len(links_for(gid))), inline=True)
+    e.add_field(name="default delivery", value=default, inline=True)
+    return e
+
+
 class DispenserPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -356,6 +369,24 @@ class DispenserPanel(discord.ui.View):
             await interaction.response.send_message("this server has more than 25 categories. remove some before using the dispenser.", ephemeral=True)
             return
         await interaction.response.send_message("choose a category.", view=CategoryView(gid, default, remove), ephemeral=True)
+
+    @discord.ui.button(label="refresh", style=discord.ButtonStyle.success, custom_id="avlink_refresh_panel")
+    async def refresh_panel(self, interaction, button):
+        if not interaction.guild:
+            await interaction.response.send_message("use this button inside a server.", ephemeral=True)
+            return
+        is_server_owner = interaction.user.id == interaction.guild.owner_id
+        has_administrator = interaction.user.guild_permissions.administrator
+        if not (is_server_owner and has_administrator):
+            await interaction.response.send_message(
+                "refreshing the panel requires both server-owner and administrator permissions.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.edit_message(
+            embed=panel_embed(interaction.guild.id),
+            view=DispenserPanel(),
+        )
 
 
 # -------------------- commands --------------------
@@ -474,9 +505,7 @@ async def panel(interaction: discord.Interaction, channel: discord.TextChannel =
     if not enabled:
         await interaction.response.send_message("the dispenser is disabled. the server owner must use /enablepanel first.", ephemeral=True); return
     target=channel or interaction.channel
-    e=discord.Embed(title="avlink link dispenser",description="select the button below, then choose a category to receive a random link.",color=discord.Color.blurple())
-    e.add_field(name="available links",value=str(len(links_for(interaction.guild.id))),inline=True)
-    e.add_field(name="default delivery",value=default,inline=True)
+    e=panel_embed(interaction.guild.id)
     try: await target.send(embed=e,view=DispenserPanel())
     except discord.Forbidden:
         await interaction.response.send_message("i can't post there. check view channel, send messages, and embed links permissions.",ephemeral=True); return
